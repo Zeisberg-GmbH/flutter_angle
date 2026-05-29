@@ -654,58 +654,94 @@ class FlutterAngle {
     if (Platform.isAndroid) {
       return;
     }
-    else if(Platform.isLinux){
-      _libEGL!.makeCurrent(_baseAppContext);
+
+    // Wrap the EGL / GL teardown in a best-effort block. When another ANGLE
+    // consumer (e.g. media_kit_video via _flutter_gl) has already invalidated
+    // the shared EGL display/context, `eglMakeCurrent` returns
+    // EGL_BAD_SURFACE and `lib_egl.dart` throws `EglException`. Letting that
+    // escape turns flutter_angle's dispose path into an unhandled exception
+    // on debug and a process-killing assertion on release. The OS reclaims
+    // any leaked GPU handles at process exit, so suppressing here is safe.
+    try {
+      if(Platform.isLinux){
+        _libEGL!.makeCurrent(_baseAppContext);
+      }
+
+      if(_useSurface && texture.surfaceId != nullptr){
+        _libEGL!.eglMakeCurrent(_display, texture.surfaceId!, texture.surfaceId!, _baseAppContext);
+        _libEGL!.eglDestroySurface(_display, texture.surfaceId!);
+        texture.surfaceId = nullptr;
+      }
+
+      if (_activeFramebuffer == texture.fboId && releaseAll) {
+        _rawOpenGl.glBindFramebuffer(GL_FRAMEBUFFER, texture.fboId);
+        if (!_isRBO) _rawOpenGl.glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D, 0, 0); //unbind texutre
+        else _rawOpenGl.glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, 0); //unbind colorbutter
+        _rawOpenGl.glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, 0); //unbind depth buffer
+        _rawOpenGl.glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+        _rawOpenGl.glClearColor(0.0, 0.0, 0.0, 0.0);
+        _rawOpenGl.glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+
+        Pointer<Uint32> fbo = calloc();
+        fbo.value = texture.fboId;
+        _rawOpenGl.glDeleteBuffers(1, fbo);
+        calloc.free(fbo);
+        _activeFramebuffer = null;
+
+        Pointer<Uint32> depth = calloc();
+        depth.value = texture.depth;
+        _rawOpenGl.glDeleteRenderbuffers(1, depth);
+        calloc.free(depth);
+      }
+    } catch (e) {
+      angleConsole.warning('flutter_angle.deleteTexture: suppressed EGL/GL error during teardown: $e');
     }
 
-    if(_useSurface && texture.surfaceId != nullptr){
-      _libEGL!.eglMakeCurrent(_display, texture.surfaceId!, texture.surfaceId!, _baseAppContext);
-      _libEGL!.eglDestroySurface(_display, texture.surfaceId!);
-      texture.surfaceId = nullptr;
+    if(releaseAll){
+      try {
+        await _channel.invokeMethod('deleteTexture',{"textureId": texture.textureId});
+      } catch (e) {
+        angleConsole.warning('flutter_angle.deleteTexture: platform channel error suppressed: $e');
+      }
     }
-
-    angleConsole.warning('There is no active FlutterGL Texture to delete');
-    if (_activeFramebuffer == texture.fboId && releaseAll) {
-      _rawOpenGl.glBindFramebuffer(GL_FRAMEBUFFER, texture.fboId);
-      if (!_isRBO) _rawOpenGl.glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D, 0, 0); //unbind texutre
-      else _rawOpenGl.glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, 0); //unbind colorbutter
-      _rawOpenGl.glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, 0); //unbind depth buffer
-      _rawOpenGl.glBindFramebuffer(GL_FRAMEBUFFER, 0);
-
-      _rawOpenGl.glClearColor(0.0, 0.0, 0.0, 0.0);
-      _rawOpenGl.glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
-
-      Pointer<Uint32> fbo = calloc();
-      fbo.value = texture.fboId;
-      _rawOpenGl.glDeleteBuffers(1, fbo);
-      calloc.free(fbo);
-      _activeFramebuffer = null;
-
-      Pointer<Uint32> depth = calloc();
-      depth.value = texture.depth;
-      _rawOpenGl.glDeleteRenderbuffers(1, depth);
-      calloc.free(depth);
-    }
-
-    if(releaseAll) await _channel.invokeMethod('deleteTexture',{"textureId": texture.textureId});
   }
 
   void dispose([List<FlutterAngleTexture?>? textures]) {
+    // Idempotent: a second dispose() must be a no-op so a co-resident
+    // consumer that triggers our dispose twice (e.g. once via widget
+    // unmount, once via a shutdown hook) cannot drive us through the
+    // half-dead native pointers.
+    if (_disposed) return;
+    _disposed = true;
+
     textures?.forEach((t) {
-      if(t!=null)deleteTexture(t);
+      if(t!=null){
+        try { deleteTexture(t); } catch (e) {
+          angleConsole.warning('flutter_angle.dispose: deleteTexture suppressed: $e');
+        }
+      }
       t = null;
     });
     textures?.clear();
+
     if(_baseAppContext != nullptr && !Platform.isLinux){
-      _libEGL!.eglDestroyContext(_display, _baseAppContext);
+      try {
+        _libEGL!.eglDestroyContext(_display, _baseAppContext);
+      } catch (e) {
+        angleConsole.warning('flutter_angle.dispose: eglDestroyContext suppressed: $e');
+      }
       _baseAppContext = nullptr;
     }
 
     _worker?.dispose();
     _worker = null;
     _libOpenGLES = null;
-    _libEGL!.dispose();
-    _disposed = true;
+    try {
+      _libEGL!.dispose();
+    } catch (e) {
+      angleConsole.warning('flutter_angle.dispose: libEGL.dispose suppressed: $e');
+    }
   }
 
   void activateTexture(FlutterAngleTexture texture) {
